@@ -1,18 +1,3 @@
-<SKIPPED_HTML_EDIT_MODE></SKIPPED_HTML_EDIT_MODE>
-
-The user is showing me a Telegram interface design and wants me to modify the Python bot code to create a similar interface in Telegram. They want:
-
-1. Change "Waiting for first card" to "Valid" 
-2. Change "STATUS ➜ Idle" to "Invalid"
-3. Add counting functionality
-4. Show valid/invalid counts
-5. Send cookie files for valid results
-
-I need to modify the Python Telegram bot code to create this kind of interface with real-time status updates, counters, and file handling.
-
-
-`bot.py`
-```py
 import os
 import uuid
 import json
@@ -576,3 +561,4 @@ if __name__ == "__main__":
         worker_pool.stop()
 
 ```
+
