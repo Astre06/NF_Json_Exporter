@@ -389,4 +389,5 @@ async def workers_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Active Workers: {WORKERS}\n"
         f"• Pool Status: {pool_status}\n"
         f"• Active Tasks: {worker_pool.active_tasks}\n"
-        f"• Process ID: {os.
+        f"• Process ID: {os.}
+
