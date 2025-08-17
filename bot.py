@@ -57,12 +57,12 @@ def next_export_filename(base="working", ext=".txt"):
     return f"{base}{next_num}{ext}"
 
 async def process_cookie_file(input_path):
-    print(f"▶️ Processing file: {input_path}")
+    logger.info(f"Processing file: {input_path}")
     try:
         with open(input_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"❌ Failed to load JSON: {e}")
+        logger.error(f"Failed to load JSON: {e}")
         return None
 
     all_cookies = data if isinstance(data, list) else [data]
@@ -72,10 +72,10 @@ async def process_cookie_file(input_path):
         try:
             playwright_cookies.append(normalize_cookie(c))
         except Exception as e:
-            print(f"⚠️ Skipping malformed cookie: {e}")
+            logger.warning(f"Skipping malformed cookie: {e}")
 
     if not playwright_cookies:
-        print("❌ No valid cookies to process.")
+        logger.error("No valid cookies to process.")
         return None
 
     async with async_playwright() as p:
@@ -85,21 +85,21 @@ async def process_cookie_file(input_path):
         try:
             await context.add_cookies(playwright_cookies)
         except Exception as e:
-            print(f"⚠️ Cookie inject failed: {e}")
+            logger.warning(f"Cookie inject failed: {e}")
             await browser.close()
             return None
 
         page = await context.new_page()
-        print(f"🌐 Navigating to {TARGET_URL}...")
+        logger.info(f"Navigating to {TARGET_URL}...")
         await page.goto(TARGET_URL, wait_until="load")
         await page.wait_for_load_state("networkidle")
 
         if page.url.startswith(TARGET_URL):
-            print("✅ Valid session — account page loaded")
+            logger.info("✅ Valid session — account page loaded")
             new_cookies = await context.cookies()
 
             if not new_cookies:
-                print("❌ No cookies returned — not exporting.")
+                logger.error("No cookies returned — not exporting.")
                 await browser.close()
                 return None
 
@@ -112,12 +112,12 @@ async def process_cookie_file(input_path):
             export_path = next_export_filename()
             with open(export_path, "w", encoding="utf-8") as f:
                 json.dump(new_cookies, f, separators=(",", ":"))
-                print(f"✅ Exported cookies to {export_path}")
+                logger.info(f"Exported cookies to {export_path}")
 
             await browser.close()
             return export_path
         else:
-            print("❌ Invalid session — redirected to login or another page")
+            logger.warning("❌ Invalid session — redirected to login or another page")
             await browser.close()
             return None
 
@@ -135,10 +135,12 @@ async def send_result(update, exported_path):
     else:
         await update.message.reply_text("❌ Cookie invalid or processing failed.")
 
-# ========== Telegram Bot Logic ==========
+# ========== Bot Commands ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I’ll process each for you.")
+    await update.message.reply_text(
+        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I’ll process each for you."
+    )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong 🏓")
@@ -193,7 +195,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(extract_dir)
         os.remove(downloaded_name)
 
-# ========== Init & Run ==========
+# ========== Run Bot ==========
 
 async def post_init(app):
     await app.bot.delete_webhook(drop_pending_updates=True)
