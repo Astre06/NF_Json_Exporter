@@ -24,10 +24,7 @@ logger = logging.getLogger(__name__)
 
 # ========== Config ==========
 BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # <-- put your bot token here
-TARGET_URL = "https://yourdomain.com/account"  # <-- page you control
 # REQUIRED: only process cookies for domains you own/control
-ALLOWED_DOMAINS = ["None"]  # <-- replace with your domain(s)
-
 # ========== Helpers ==========
 
 def _domain_from_url(url: str) -> str:
@@ -312,4 +309,5 @@ app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("🤖 Bot is running...")
 app.run_polling(drop_pending_updates=True)
+
 
