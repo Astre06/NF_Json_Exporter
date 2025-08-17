@@ -9,7 +9,7 @@ from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from playwright.async_api import async_playwright
 
-BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # Replace with your bot token
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # ← Replace with your bot token
 TARGET_URL = "https://www.netflix.com/account"
 
 # ========== Helpers ==========
@@ -126,7 +126,7 @@ async def send_result(update, exported_path):
 # ========== Telegram Bot Logic ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a `.txt`, `.zip`, or `.rar` file containing cookies and I’ll process them.")
+    await update.message.reply_text("👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I’ll process each for you.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
@@ -142,14 +142,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     unique_id = uuid.uuid4().hex[:8]
     downloaded_name = f"upload_{unique_id}{file_ext}"
-    await document.get_file().then(lambda f: f.download_to_drive(downloaded_name))
+    telegram_file = await document.get_file()
+    await telegram_file.download_to_drive(downloaded_name)
 
     if file_ext == ".txt":
         await update.message.reply_text("🔄 Processing your cookie...")
         exported_path = await process_cookie_file(downloaded_name)
         await send_result(update, exported_path)
         os.remove(downloaded_name)
-
     else:
         extract_dir = f"extracted_{unique_id}"
         os.makedirs(extract_dir, exist_ok=True)
