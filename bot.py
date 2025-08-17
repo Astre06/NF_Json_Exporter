@@ -385,13 +385,8 @@ async def workers_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to show current worker configuration"""
     pool_status = 'Running' if worker_pool.executor else 'Stopped'
     await update.message.reply_text(
-    f"⚙️ Worker Configuration:\n"
-    f"• Active Workers: {WORKERS}\n"
-    f"• Pool Status: {pool_status}\n"
-    f"• Active Tasks: {worker_pool.active_tasks}\n"
-    f"• Process ID: {os.getpid()}"
-)
-
-
-
-
+        f"⚙️ Worker Configuration:\n"
+        f"• Active Workers: {WORKERS}\n"
+        f"• Pool Status: {pool_status}\n"
+        f"• Active Tasks: {worker_pool.active_tasks}\n"
+        
