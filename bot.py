@@ -4,12 +4,11 @@ import uuid
 import json
 import asyncio
 import re
-import subprocess
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from playwright.async_api import async_playwright
 
-BOT_TOKEN = "8495284623:AAE7LvbTXLWsEnkezCvkgqfG8m7Wmvo4N7c"  # Replace with your actual token
+BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # ← Replace with your bot token
 TARGET_URL = "https://www.netflix.com/account"
 
 # ========== Helpers ==========
@@ -101,6 +100,7 @@ async def process_cookie_file(input_path):
             with open(export_path, "w", encoding="utf-8") as f:
                 json.dump(new_cookies, f, separators=(",", ":"))
                 print(f"✅ Exported cookies to {export_path}")
+
             await browser.close()
             return export_path
         else:
@@ -108,7 +108,7 @@ async def process_cookie_file(input_path):
             await browser.close()
             return None
 
-# ========== Telegram Bot ==========
+# ========== Telegram Bot Logic ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Send me a `.txt` cookie file and I’ll send back the exported one.")
@@ -131,10 +131,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if exported_path and os.path.isfile(exported_path):
         file_size = os.path.getsize(exported_path)
         if file_size > 10:
-            await update.message.reply_document(
-                document=InputFile(exported_path),
-                filename=exported_path
-            )
+            print(f"📎 Sending file: {exported_path} ({file_size} bytes)")
+            with open(exported_path, "rb") as f:
+                await update.message.reply_document(
+                    document=InputFile(f, filename=os.path.basename(exported_path))
+                )
         else:
             await update.message.reply_text("❌ Exported file is too small or empty.")
     else:
@@ -142,7 +143,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     os.remove(filename)
 
-# ========== Run Bot ==========
+# ========== Start the Bot ==========
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
