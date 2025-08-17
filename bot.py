@@ -5,6 +5,8 @@ import asyncio
 import re
 import shutil
 import logging
+from urllib.parse import urlparse
+
 from pyunpack import Archive
 from telegram import Update, InputFile
 from telegram.ext import (
@@ -21,10 +23,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========== Config ==========
-BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"
-TARGET_URL = "https://www.netflix.com/account"
+BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # <-- put your bot token here
+TARGET_URL = "https://yourdomain.com/account"  # <-- page you control
+# REQUIRED: only process cookies for domains you own/control
+ALLOWED_DOMAINS = ["Netflix.com"]  # <-- replace with your domain(s)
 
 # ========== Helpers ==========
+
+def _domain_from_url(url: str) -> str:
+    try:
+        netloc = urlparse(url).netloc.lower()
+        # strip port and common prefix
+        if ":" in netloc:
+            netloc = netloc.split(":", 1)[0]
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
+    except Exception:
+        return ""
+
+def _is_allowed_domain(host: str, allowed) -> bool:
+    host = host.lstrip(".").lower()
+    return any(host.endswith(d.lower()) for d in allowed)
 
 def normalize_cookie(c):
     out = {
@@ -56,23 +76,99 @@ def next_export_filename(base="working", ext=".txt"):
     next_num = max(nums, default=0) + 1
     return f"{base}{next_num}{ext}"
 
+def parse_netscape_cookie_file_flexible(path, allowed_domains=None):
+    """
+    Robust Netscape/Mozilla cookie parser.
+    Accepts lines starting with '.' (domain cookie) or alnum (host cookie),
+    skips '#' comments and blank lines.
+    Handles classic 7-column format and shorter variants.
+
+    Returns Playwright-compatible cookie dicts.
+    Filters to allowed_domains if provided.
+    """
+    cookies = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not (line.startswith(".") or line[0].isalnum()):
+                continue
+
+            parts = re.split(r"\s+", line)
+            if len(parts) < 2:
+                continue
+
+            # Canonical order (best-effort for short lines):
+            # domain, include_subdomains, path, secure, expires, name, value
+            domain = parts[0]
+            path = parts[2] if len(parts) > 2 else "/"
+            secure_flag = parts[3] if len(parts) > 3 else "FALSE"
+            expires_str = parts[4] if len(parts) > 4 else "-1"
+            name = parts[5] if len(parts) > 5 else ""
+            value = parts[6] if len(parts) > 6 else ""
+
+            if allowed_domains and not any(domain.lstrip(".").lower().endswith(d.lower()) for d in allowed_domains):
+                continue
+
+            try:
+                expires = int(expires_str)
+            except ValueError:
+                expires = None
+
+            cookies.append({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": path or "/",
+                "httpOnly": False,  # not present in Netscape files
+                "secure": str(secure_flag).upper() == "TRUE",
+                **({"expires": expires} if (isinstance(expires, int) and expires > 0) else {}),
+                "sameSite": "Lax",  # Netscape doesn't encode this
+            })
+    return cookies
+
 async def process_cookie_file(input_path):
     logger.info(f"Processing file: {input_path}")
+
+    # Guardrails
+    if not isinstance(ALLOWED_DOMAINS, (list, tuple)) or not ALLOWED_DOMAINS:
+        logger.error("ALLOWED_DOMAINS must be a non-empty list of domains you control.")
+        return None
+    target_host = _domain_from_url(TARGET_URL)
+    if not target_host or not _is_allowed_domain(target_host, ALLOWED_DOMAINS):
+        logger.error(f"TARGET_URL domain '{target_host}' is not in ALLOWED_DOMAINS {ALLOWED_DOMAINS}.")
+        return None
+
+    playwright_cookies = []
+
+    # --- Try JSON first ---
     try:
         with open(input_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception as e:
-        logger.error(f"Failed to load JSON: {e}")
-        return None
-
-    all_cookies = data if isinstance(data, list) else [data]
-    playwright_cookies = []
-
-    for c in all_cookies:
+        all_cookies = data if isinstance(data, list) else [data]
+        for c in all_cookies:
+            try:
+                # filter here too
+                dom = c.get("domain", "")
+                if dom and not _is_allowed_domain(dom, ALLOWED_DOMAINS):
+                    continue
+                playwright_cookies.append(normalize_cookie(c))
+            except Exception as e:
+                logger.warning(f"Skipping malformed cookie: {e}")
+    except Exception as e_json:
+        logger.info(f"Not JSON or failed to parse JSON: {e_json}")
+        # --- Fallback: Netscape flexible parser ---
         try:
-            playwright_cookies.append(normalize_cookie(c))
-        except Exception as e:
-            logger.warning(f"Skipping malformed cookie: {e}")
+            netscape_cookies = parse_netscape_cookie_file_flexible(
+                input_path,
+                allowed_domains=ALLOWED_DOMAINS
+            )
+            if netscape_cookies:
+                playwright_cookies.extend(netscape_cookies)
+                logger.info(f"Parsed {len(netscape_cookies)} cookie(s) from Netscape format")
+        except Exception as e_ns:
+            logger.error(f"Failed to parse Netscape cookie file: {e_ns}")
 
     if not playwright_cookies:
         logger.error("No valid cookies to process.")
@@ -93,6 +189,13 @@ async def process_cookie_file(input_path):
         logger.info(f"Navigating to {TARGET_URL}...")
         await page.goto(TARGET_URL, wait_until="load")
         await page.wait_for_load_state("networkidle")
+
+        # extra safety: confirm we stayed on an allowed domain
+        final_host = _domain_from_url(page.url)
+        if not _is_allowed_domain(final_host, ALLOWED_DOMAINS):
+            logger.warning(f"Final URL '{page.url}' not in allowed domains {ALLOWED_DOMAINS}")
+            await browser.close()
+            return None
 
         if page.url.startswith(TARGET_URL):
             logger.info("✅ Valid session — account page loaded")
