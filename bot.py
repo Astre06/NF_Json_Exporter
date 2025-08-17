@@ -5,7 +5,7 @@ import subprocess
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
-BOT_TOKEN = "8495284623:AAH_XdT-TbKg9LH41ZYwXvmxNZwhkNtaCT8"  # Replace if needed
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your actual token
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Send me a `.txt` cookie file and I’ll send back the exported one.")
@@ -23,9 +23,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔄 Processing your cookie...")
 
-    # Run the cookie processor
+    # Run Function.py with logging
     result = subprocess.run(["python3", "Function.py", filename], capture_output=True, text=True)
 
+    # Log to console (VPS)
+    print("📁 Current working directory:", os.getcwd())
+    print("▶️ STDOUT:\n", result.stdout)
+    print("⚠️ STDERR:\n", result.stderr)
+
+    if result.returncode != 0:
+        await update.message.reply_text(f"❌ Script crashed:\n{result.stderr.strip()[:1000]}")
+        os.remove(filename)
+        return
+
+    # Check for output
     exported_files = sorted(
         [f for f in os.listdir() if f.startswith("exported_") and f.endswith(".txt")],
         key=os.path.getmtime,
@@ -35,7 +46,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if exported_files:
         await update.message.reply_document(InputFile(exported_files[0]))
     else:
-        await update.message.reply_text("❌ Cookie invalid or processing failed.")
+        await update.message.reply_text("❌ Cookie invalid or processing failed (no file created).")
 
     os.remove(filename)
 
@@ -45,4 +56,3 @@ app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("🤖 Bot is running...")
 app.run_polling()
-
