@@ -389,6 +389,104 @@ async def workers_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Active Workers: {WORKERS}\n"
         f"• Pool Status: {pool_status}\n"
         f"• Active Tasks: {worker_pool.active_tasks}\n"
+        f"• Process ID: {os.getpid()}"
     )
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("❌ Please send a valid file.")
+        return
+
+    file_ext = os.path.splitext(document.file_name)[-1].lower()
+
+    if file_ext not in [".txt", ".zip", ".rar"]:
+        await update.message.reply_text("❌ Please send a `.txt`, `.zip`, or `.rar` file only.")
+        return
+
+    unique_id = uuid.uuid4().hex[:8]
+    downloaded_name = f"upload_{unique_id}{file_ext}"
+    telegram_file = await document.get_file()
+    await telegram_file.download_to_drive(downloaded_name)
+
+    if file_ext == ".txt":
+        await update.message.reply_text(f"🔄 Processing your cookie with {WORKERS} workers...")
+        exported_path = await process_cookie_file(downloaded_name)
+        await send_result(update, exported_path)
+        os.remove(downloaded_name)
+    else:
+        extract_dir = f"extracted_{unique_id}"
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            Archive(downloaded_name).extractall(extract_dir)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to extract archive: {e}")
+            shutil.rmtree(extract_dir)
+            os.remove(downloaded_name)
+            return
+
+        # Collect all .txt files
+        txt_files = []
+        for root, dirs, files in os.walk(extract_dir):
+            for filename in files:
+                if filename.endswith(".txt"):
+                    txt_files.append((os.path.join(root, filename), filename))
+        
+        if not txt_files:
+            await update.message.reply_text("❌ No valid `.txt` cookie files found in the archive.")
+            shutil.rmtree(extract_dir)
+            os.remove(downloaded_name)
+            return
+        
+        # Choose processing method based on file count
+        if len(txt_files) <= 10:
+            # Use parallel processing for smaller batches
+            processed = await process_files_in_parallel(txt_files, update)
+        else:
+            # Use batch processing for large archives
+            processed = await process_files_in_batches(txt_files, update)
+
+        if processed == 0:
+            await update.message.reply_text("❌ No valid cookie files were processed successfully.")
+        else:
+            await update.message.reply_text(f"🎉 Successfully processed {processed}/{len(txt_files)} files with {WORKERS} parallel workers!")
+
+        shutil.rmtree(extract_dir)
+        os.remove(downloaded_name)
+
+# ========== Application Shutdown Handler ==========
+async def shutdown_handler(app):
+    """Gracefully shutdown worker pool"""
+    logger.info("Shutting down worker pool...")
+    worker_pool.stop()
+
+# ========== Run Bot ==========
+
+async def post_init(app):
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    me = await app.bot.get_me()
+    logger.info("✅ Logged in as @%s (%s)", me.username, me.id)
+    logger.info(f"🔧 Initialized with {WORKERS} parallel workers")
+    
+    # Start worker pool
+    worker_pool.start()
+
+if __name__ == "__main__":
+    # Set multiprocessing start method for compatibility
+    multiprocessing.set_start_method('spawn', force=True)
+    
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("workers", workers_info))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    try:
+        print(f"🤖 Bot is running with {WORKERS} parallel workers...")
+        app.run_polling(drop_pending_updates=True)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    finally:
+        # Cleanup worker pool
+        worker_pool.stop()
 
