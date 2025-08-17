@@ -6,18 +6,19 @@ import re
 import shutil
 import logging
 import multiprocessing
+import time
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from pyunpack import Archive
-from telegram import Update, InputFile
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
-    ContextTypes, filters
+    ContextTypes, filters, CallbackQueryHandler
 )
 from playwright.async_api import async_playwright
 
 # ========== Configuration ==========
-WORKERS = 3  # Change this to adjust worker count
+WORKERS = 5  # Change this to adjust worker count
 BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"
 TARGET_URL = "https://www.netflix.com/account"
 
@@ -28,26 +29,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== Global Counters ==========
-class ProcessingStats:
+# ========== Global Progress Tracking ==========
+class ProgressTracker:
     def __init__(self):
-        self.valid_count = 0
-        self.invalid_count = 0
-        self.total_count = 0
-        self.processed_count = 0
-        self.valid_files = []
-        self.status_message_id = None
-        
+        self.reset()
+    
     def reset(self):
-        self.valid_count = 0
-        self.invalid_count = 0
-        self.total_count = 0
-        self.processed_count = 0
-        self.valid_files = []
+        self.total_files = 0
+        self.processed_files = 0
+        self.valid_files = 0
+        self.invalid_files = 0
         self.status_message_id = None
+        self.chat_id = None
+        self.start_time = None
+    
+    def set_total(self, total):
+        self.total_files = total
+        self.start_time = time.time()
+    
+    def increment_processed(self, is_valid=False):
+        self.processed_files += 1
+        if is_valid:
+            self.valid_files += 1
+        else:
+            self.invalid_files += 1
 
-# Global stats instance
-stats = ProcessingStats()
+# Global progress tracker
+progress = ProgressTracker()
 
 # ========== Helpers ==========
 
@@ -125,37 +133,73 @@ def parse_netscape_cookies(file_path):
     
     return cookies
 
-def create_status_message(filename):
-    """Create the status message text"""
-    progress_bar_length = 20
-    if stats.total_count > 0:
-        progress = int((stats.processed_count / stats.total_count) * progress_bar_length)
+def create_status_keyboard(valid_count=0, invalid_count=0):
+    """Create inline keyboard with status buttons"""
+    keyboard = [
+        [
+            InlineKeyboardButton(f"✅ Valid: {valid_count}", callback_data="valid_status"),
+            InlineKeyboardButton(f"❌ Invalid: {invalid_count}", callback_data="invalid_status")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def update_progress_message(context, force_update=False):
+    """Update the progress message with current status"""
+    if not progress.status_message_id or not progress.chat_id:
+        return
+    
+    # Calculate processing speed
+    elapsed_time = time.time() - progress.start_time if progress.start_time else 0
+    speed = progress.processed_files / elapsed_time if elapsed_time > 0 else 0
+    
+    # Create progress bar
+    if progress.total_files > 0:
+        progress_percent = (progress.processed_files / progress.total_files) * 100
+        bar_length = 20
+        filled_length = int(bar_length * progress.processed_files / progress.total_files)
+        bar = '█' * filled_length + '░' * (bar_length - filled_length)
     else:
-        progress = 0
+        progress_percent = 0
+        bar = '░' * 20
     
-    progress_bar = "█" * progress + "░" * (progress_bar_length - progress)
+    # Format time
+    def format_time(seconds):
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        elif seconds < 3600:
+            return f"{int(seconds//60)}m {int(seconds%60)}s"
+        else:
+            return f"{int(seconds//3600)}h {int((seconds%3600)//60)}m"
     
-    return f"""📄 **{filename}**
-Processing {stats.processed_count}/{stats.total_count}...
-
-{progress_bar} {stats.processed_count}/{stats.total_count}
-
-• **Valid** ✅ {stats.valid_count}
-• **Invalid** ❌ {stats.invalid_count}
-
-🔄 **STATUS** ➜ Processing"""
-
-def create_final_status_message(filename):
-    """Create the final status message"""
-    return f"""📄 **{filename}**
-✅ **Processing Complete!**
-
-📊 **Final Results:**
-• **Valid** ✅ {stats.valid_count}
-• **Invalid** ❌ {stats.invalid_count}
-• **Total Processed** 📈 {stats.processed_count}
-
-🎉 **STATUS** ➜ Complete"""
+    # Estimate remaining time
+    if speed > 0 and progress.processed_files < progress.total_files:
+        remaining_files = progress.total_files - progress.processed_files
+        eta = remaining_files / speed
+        eta_text = f"ETA: {format_time(eta)}"
+    else:
+        eta_text = "ETA: --"
+    
+    status_text = f"📊 **Processing Status**\n\n"
+    status_text += f"📁 Processing: **{progress.processed_files}/{progress.total_files}**\n"
+    status_text += f"📈 Progress: **{progress_percent:.1f}%**\n"
+    status_text += f"`{bar}`\n\n"
+    status_text += f"⚡ Speed: **{speed:.1f} files/sec**\n"
+    status_text += f"⏱️ Elapsed: **{format_time(elapsed_time)}**\n"
+    status_text += f"🕒 {eta_text}\n\n"
+    status_text += f"✅ Valid: **{progress.valid_files}**\n"
+    status_text += f"❌ Invalid: **{progress.invalid_files}**"
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=progress.chat_id,
+            message_id=progress.status_message_id,
+            text=status_text,
+            parse_mode='Markdown',
+            reply_markup=create_status_keyboard(progress.valid_files, progress.invalid_files)
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            logger.warning(f"Failed to update progress message: {e}")
 
 # ========== Worker Process Function ==========
 def process_cookie_file_worker(input_path):
@@ -295,147 +339,182 @@ worker_pool = WorkerPool(max_workers=WORKERS)
 # Semaphore to control concurrent operations
 semaphore = asyncio.Semaphore(WORKERS)
 
-async def process_cookie_file(input_path):
+async def process_cookie_file(input_path, context):
     """Main interface for processing cookie files using worker pool with concurrency control"""
     async with semaphore:
-        return await worker_pool.process_file(input_path)
+        result = await worker_pool.process_file(input_path)
+        progress.increment_processed(is_valid=(result is not None))
+        await update_progress_message(context)
+        return result
 
-async def update_status_message(update, filename):
-    """Update the status message with current progress"""
-    try:
-        if stats.status_message_id:
-            await update.message.bot.edit_message_text(
-                chat_id=update.message.chat_id,
-                message_id=stats.status_message_id,
-                text=create_status_message(filename),
-                parse_mode='Markdown'
-            )
-    except Exception as e:
-        logger.error(f"Failed to update status message: {e}")
-
-async def send_valid_file(update, exported_path, original_filename):
-    """Send valid cookie file to user"""
+async def send_result(update, exported_path, filename=None):
+    """Send valid cookie file back to user"""
     if exported_path and os.path.isfile(exported_path):
         file_size = os.path.getsize(exported_path)
         if file_size > 10:
             with open(exported_path, "rb") as f:
+                display_name = filename if filename else os.path.basename(exported_path)
                 await update.message.reply_document(
-                    document=InputFile(f, filename=f"valid_{original_filename}"),
-                    caption=f"✅ **Valid Cookie Found!**\n📄 {original_filename}\n🔥 Ready to use!"
+                    document=InputFile(f, filename=f"valid_{display_name}"),
+                    caption=f"✅ **Valid Cookie File**\n📁 Original: `{filename or 'Unknown'}`\n📊 Size: {file_size} bytes",
+                    parse_mode='Markdown'
                 )
-        os.remove(exported_path)
+        else:
+            logger.warning(f"Exported file for {filename or 'file'} is too small.")
+        
+        # Clean up the temporary file
+        try:
+            os.remove(exported_path)
+        except:
+            pass
         return True
-    return False
+    else:
+        return False
 
 # ========== Parallel Processing Functions ==========
 
-async def process_files_in_parallel(txt_files, update, archive_name):
+async def process_files_in_parallel(txt_files, update, context):
     """Process multiple files in parallel using all available workers"""
-    stats.reset()
-    stats.total_count = len(txt_files)
+    total_files = len(txt_files)
+    progress.set_total(total_files)
+    progress.chat_id = update.effective_chat.id
     
-    # Send initial status message
+    # Send initial progress message
     status_msg = await update.message.reply_text(
-        create_status_message(archive_name),
-        parse_mode='Markdown'
+        "🚀 **Starting Processing...**\n\n📁 Initializing workers...",
+        parse_mode='Markdown',
+        reply_markup=create_status_keyboard(0, 0)
     )
-    stats.status_message_id = status_msg.message_id
+    progress.status_message_id = status_msg.message_id
+    
+    if total_files == 1:
+        # Single file - just process it
+        full_path, filename = txt_files[0]
+        exported_path = await process_cookie_file(full_path, context)
+        await send_result(update, exported_path, filename)
+        return progress.valid_files
+    
+    # Multiple files - process in parallel
+    await update_progress_message(context)
     
     # Create tasks for all files
     tasks = []
     file_info = []
     
     for full_path, filename in txt_files:
-        task = process_cookie_file(full_path)
+        task = process_cookie_file(full_path, context)
         tasks.append(task)
         file_info.append((full_path, filename))
     
-    # Process files with real-time updates
-    for i, (task, (full_path, filename)) in enumerate(zip(tasks, file_info)):
-        try:
-            result = await task
-            stats.processed_count += 1
-            
-            if result:  # Valid cookie
-                stats.valid_count += 1
-                stats.valid_files.append((result, filename))
-                # Send the valid file immediately
-                await send_valid_file(update, result, filename)
-            else:  # Invalid cookie
-                stats.invalid_count += 1
-            
-            # Update status message every few files or at the end
-            if stats.processed_count % 3 == 0 or stats.processed_count == stats.total_count:
-                await update_status_message(update, archive_name)
-                
-        except Exception as e:
-            logger.error(f"Failed to process {filename}: {e}")
-            stats.invalid_count += 1
-            stats.processed_count += 1
+    # Process all files in parallel
+    logger.info(f"Executing {len(tasks)} tasks in parallel...")
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Send final status
-    await update.message.bot.edit_message_text(
-        chat_id=update.message.chat_id,
-        message_id=stats.status_message_id,
-        text=create_final_status_message(archive_name),
-        parse_mode='Markdown'
+    # Process results and send valid files
+    for i, (result, (full_path, filename)) in enumerate(zip(results, file_info)):
+        if isinstance(result, Exception):
+            logger.error(f"Failed to process {filename}: {result}")
+        elif result:
+            await send_result(update, result, filename)
+    
+    # Final status update
+    await update_progress_message(context, force_update=True)
+    
+    return progress.valid_files
+
+async def process_files_in_batches(txt_files, update, context, batch_size=None):
+    """Process files in batches for better progress tracking with large archives"""
+    if batch_size is None:
+        batch_size = WORKERS * 2
+    
+    total_files = len(txt_files)
+    progress.set_total(total_files)
+    progress.chat_id = update.effective_chat.id
+    
+    # Send initial progress message
+    status_msg = await update.message.reply_text(
+        "🚀 **Starting Batch Processing...**\n\n📁 Preparing large archive...",
+        parse_mode='Markdown',
+        reply_markup=create_status_keyboard(0, 0)
     )
+    progress.status_message_id = status_msg.message_id
     
-    # Send summary
-    if stats.valid_count > 0:
-        await update.message.reply_text(
-            f"🎉 **Processing Complete!**\n\n"
-            f"✅ Found **{stats.valid_count} valid** Netflix accounts\n"
-            f"❌ **{stats.invalid_count}** invalid accounts\n"
-            f"📊 Total: **{stats.processed_count}** files processed\n\n"
-            f"💾 All valid cookie files have been sent above!"
-        )
-    else:
-        await update.message.reply_text(
-            f"💔 **No Valid Accounts Found**\n\n"
-            f"❌ All **{stats.invalid_count}** accounts were invalid\n"
-            f"📊 Total: **{stats.processed_count}** files processed"
-        )
+    # Process files in batches
+    for i in range(0, total_files, batch_size):
+        batch = txt_files[i:i + batch_size]
+        
+        # Process current batch in parallel
+        batch_tasks = []
+        batch_info = []
+        
+        for full_path, filename in batch:
+            task = process_cookie_file(full_path, context)
+            batch_tasks.append(task)
+            batch_info.append((full_path, filename))
+        
+        # Execute batch in parallel
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        
+        # Handle batch results and send valid files
+        for result, (full_path, filename) in zip(batch_results, batch_info):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to process {filename}: {result}")
+            elif result:
+                await send_result(update, result, filename)
     
-    return stats.valid_count
+    # Final status update
+    await update_progress_message(context, force_update=True)
+    
+    return progress.valid_files
 
 # ========== Bot Commands ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🚀 **Netflix Cookie Checker**\n\n"
-        f"Send me a `.txt`, `.zip`, or `.rar` cookie file and I'll check each account!\n\n"
-        f"⚡ **Features:**\n"
-        f"• {WORKERS} parallel workers\n"
-        f"• Real-time progress tracking\n"
-        f"• Valid/Invalid counters\n"
-        f"• Automatic file delivery\n\n"
-        f"📤 Just send your files to get started!",
-        parse_mode='Markdown'
+    welcome_text = (
+        "🎬 **Netflix Cookie Validator Bot**\n\n"
+        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I'll validate each one for you.\n\n"
+        "⚡ **Features:**\n"
+        f"• {WORKERS} parallel workers for lightning-fast processing\n"
+        "• Real-time progress tracking\n"
+        "• Automatic valid cookie extraction\n"
+        "• Support for JSON and Netscape cookie formats\n\n"
+        "🚀 **Ready to process your cookies!**"
     )
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🏓 **Pong!**\n\n"
-        f"⚙️ Workers: **{WORKERS}**\n"
-        f"🔥 Parallel processing: **Enabled**\n"
-        f"📊 Status: **Ready**",
+        f"⚙️ **System Status:**\n"
+        f"• Workers: {WORKERS}\n"
+        f"• Active Tasks: {worker_pool.active_tasks}\n"
+        f"• Status: Ready\n"
+        f"• Parallel Processing: Enabled",
         parse_mode='Markdown'
     )
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current processing statistics"""
+async def workers_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to show current worker configuration"""
     pool_status = 'Running' if worker_pool.executor else 'Stopped'
-    await update.message.reply_text(
-        f"📊 **Current Statistics**\n\n"
-        f"✅ Valid: **{stats.valid_count}**\n"
-        f"❌ Invalid: **{stats.invalid_count}**\n"
-        f"📈 Processed: **{stats.processed_count}/{stats.total_count}**\n"
-        f"⚙️ Workers: **{WORKERS}**\n"
-        f"🔧 Pool Status: **{pool_status}**\n"
-        f"🎯 Active Tasks: **{worker_pool.active_tasks}**",
-        parse_mode='Markdown'
+    info_text = (
+        f"⚙️ **Worker Configuration**\n\n"
+        f"• Active Workers: **{WORKERS}**\n"
+        f"• Pool Status: **{pool_status}**\n"
+        f"• Active Tasks: **{worker_pool.active_tasks}**\n"
+        f"• Process ID: **{os.getpid()}**\n"
+        f"• Current Processing: **{progress.processed_files}/{progress.total_files}**"
     )
+    await update.message.reply_text(info_text, parse_mode='Markdown')
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button presses"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "valid_status":
+        await query.answer("✅ Valid cookies will be sent to you automatically!")
+    elif query.data == "invalid_status":
+        await query.answer("❌ Invalid cookies are discarded automatically!")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
@@ -446,54 +525,63 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_ext = os.path.splitext(document.file_name)[-1].lower()
 
     if file_ext not in [".txt", ".zip", ".rar"]:
-        await update.message.reply_text("❌ Please send a `.txt`, `.zip`, or `.rar` file only.")
-        return
-
-    unique_id = uuid.uuid4().hex[:8]
-    downloaded_name = f"upload_{unique_id}{file_ext}"
-    telegram_file = await document.get_file()
-    await telegram_file.download_to_drive(downloaded_name)
-
-    if file_ext == ".txt":
-        # Single file processing
-        stats.reset()
-        stats.total_count = 1
-        
-        status_msg = await update.message.reply_text(
-            f"📄 **{document.file_name}**\n🔄 Processing single file...\n\n• **Valid** ✅ 0\n• **Invalid** ❌ 0\n\n🔄 **STATUS** ➜ Checking",
+        await update.message.reply_text(
+            "❌ **Invalid file format!**\n\n"
+            "Please send only:\n"
+            "• `.txt` cookie files\n"
+            "• `.zip` archives\n"
+            "• `.rar` archives",
             parse_mode='Markdown'
         )
-        stats.status_message_id = status_msg.message_id
+        return
+
+    # Reset progress tracker for new job
+    progress.reset()
+    
+    unique_id = uuid.uuid4().hex[:8]
+    downloaded_name = f"upload_{unique_id}{file_ext}"
+    
+    # Download file with progress indicator
+    download_msg = await update.message.reply_text("📥 **Downloading file...**", parse_mode='Markdown')
+    telegram_file = await document.get_file()
+    await telegram_file.download_to_drive(downloaded_name)
+    await download_msg.edit_text("✅ **File downloaded successfully!**", parse_mode='Markdown')
+
+    if file_ext == ".txt":
+        progress.set_total(1)
+        progress.chat_id = update.effective_chat.id
         
-        exported_path = await process_cookie_file(downloaded_name)
+        status_msg = await update.message.reply_text(
+            "🔄 **Processing single cookie file...**",
+            parse_mode='Markdown',
+            reply_markup=create_status_keyboard(0, 0)
+        )
+        progress.status_message_id = status_msg.message_id
         
-        if exported_path:
-            stats.valid_count = 1
-            await send_valid_file(update, exported_path, document.file_name)
-            await update.message.bot.edit_message_text(
-                chat_id=update.message.chat_id,
-                message_id=stats.status_message_id,
-                text=f"📄 **{document.file_name}**\n✅ **Valid Account Found!**\n\n• **Valid** ✅ 1\n• **Invalid** ❌ 0\n\n🎉 **STATUS** ➜ Complete",
-                parse_mode='Markdown'
-            )
-        else:
-            stats.invalid_count = 1
-            await update.message.bot.edit_message_text(
-                chat_id=update.message.chat_id,
-                message_id=stats.status_message_id,
-                text=f"📄 **{document.file_name}**\n❌ **Invalid Account**\n\n• **Valid** ✅ 0\n• **Invalid** ❌ 1\n\n💔 **STATUS** ➜ Complete",
-                parse_mode='Markdown'
-            )
-            
+        exported_path = await process_cookie_file(downloaded_name, context)
+        await send_result(update, exported_path, document.file_name)
+        
+        # Final status
+        final_text = (
+            f"✅ **Processing Complete!**\n\n"
+            f"📁 File: `{document.file_name}`\n"
+            f"📊 Result: {'Valid' if exported_path else 'Invalid'}\n"
+            f"⏱️ Processing time: {time.time() - progress.start_time:.1f}s"
+        )
+        await status_msg.edit_text(final_text, parse_mode='Markdown')
+        
         os.remove(downloaded_name)
+        
     else:
-        # Archive processing
+        extract_msg = await update.message.reply_text("📦 **Extracting archive...**", parse_mode='Markdown')
         extract_dir = f"extracted_{unique_id}"
         os.makedirs(extract_dir, exist_ok=True)
+        
         try:
             Archive(downloaded_name).extractall(extract_dir)
+            await extract_msg.edit_text("✅ **Archive extracted successfully!**", parse_mode='Markdown')
         except Exception as e:
-            await update.message.reply_text(f"❌ Failed to extract archive: {e}")
+            await extract_msg.edit_text(f"❌ **Extraction failed:** `{str(e)[:100]}`", parse_mode='Markdown')
             shutil.rmtree(extract_dir)
             os.remove(downloaded_name)
             return
@@ -506,20 +594,37 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     txt_files.append((os.path.join(root, filename), filename))
         
         if not txt_files:
-            await update.message.reply_text("❌ No valid `.txt` cookie files found in the archive.")
+            await update.message.reply_text(
+                "❌ **No cookie files found!**\n\n"
+                "The archive doesn't contain any `.txt` files.",
+                parse_mode='Markdown'
+            )
             shutil.rmtree(extract_dir)
             os.remove(downloaded_name)
             return
         
-        await update.message.reply_text(
-            f"📁 **Archive Processed**\n\n"
-            f"Found **{len(txt_files)}** cookie files\n"
-            f"🚀 Starting parallel processing with **{WORKERS}** workers...",
-            parse_mode='Markdown'
+        # Choose processing method based on file count
+        if len(txt_files) <= 10:
+            processed = await process_files_in_parallel(txt_files, update, context)
+        else:
+            processed = await process_files_in_batches(txt_files, update, context)
+
+        # Send summary
+        summary_text = (
+            f"🎉 **Processing Complete!**\n\n"
+            f"📁 **Archive:** `{document.file_name}`\n"
+            f"📊 **Results:**\n"
+            f"• Total files: **{len(txt_files)}**\n"
+            f"• Valid cookies: **{progress.valid_files}**\n"
+            f"• Invalid cookies: **{progress.invalid_files}**\n"
+            f"• Success rate: **{(progress.valid_files/len(txt_files)*100):.1f}%**\n\n"
+            f"⚡ **Performance:**\n"
+            f"• Workers used: **{WORKERS}**\n"
+            f"• Processing time: **{time.time() - progress.start_time:.1f}s**\n"
+            f"• Average speed: **{len(txt_files)/(time.time() - progress.start_time):.1f} files/sec**"
         )
         
-        # Process files in parallel with real-time updates
-        processed = await process_files_in_parallel(txt_files, update, document.file_name)
+        await update.message.reply_text(summary_text, parse_mode='Markdown')
 
         shutil.rmtree(extract_dir)
         os.remove(downloaded_name)
@@ -548,16 +653,18 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("workers", workers_info))
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     try:
-        print(f"🤖 Bot is running with {WORKERS} parallel workers...")
+        print(f"🤖 Netflix Cookie Bot is running with {WORKERS} parallel workers...")
+        print(f"⚡ Real-time progress tracking enabled")
+        print(f"📊 Enhanced UI with inline status buttons")
         app.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     finally:
         # Cleanup worker pool
         worker_pool.stop()
-
 
