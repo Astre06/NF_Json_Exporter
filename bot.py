@@ -17,7 +17,7 @@ from telegram.ext import (
 from playwright.async_api import async_playwright
 
 # ========== Configuration ==========
-WORKERS = 3  # Change this to adjust worker count
+WORKERS = 5  # Change this to adjust worker count
 BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"
 TARGET_URL = "https://www.netflix.com/account"
 
