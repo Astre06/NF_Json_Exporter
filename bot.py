@@ -1,14 +1,15 @@
-# bot.py
 import os
 import uuid
 import json
 import asyncio
 import re
+import shutil
+from pyunpack import Archive
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from playwright.async_api import async_playwright
 
-BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # ← Replace with your bot token
+BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # Replace with your bot token
 TARGET_URL = "https://www.netflix.com/account"
 
 # ========== Helpers ==========
@@ -108,40 +109,74 @@ async def process_cookie_file(input_path):
             await browser.close()
             return None
 
-# ========== Telegram Bot Logic ==========
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a `.txt` cookie file and I’ll send back the exported one.")
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    document = update.message.document
-
-    if not document or not document.file_name.endswith(".txt"):
-        await update.message.reply_text("❌ Please send a `.txt` file only.")
-        return
-
-    filename = f"cookie_{uuid.uuid4().hex[:8]}.txt"
-    telegram_file = await document.get_file()
-    await telegram_file.download_to_drive(filename)
-
-    await update.message.reply_text("🔄 Processing your cookie...")
-
-    exported_path = await process_cookie_file(filename)
-
+async def send_result(update, exported_path):
     if exported_path and os.path.isfile(exported_path):
         file_size = os.path.getsize(exported_path)
         if file_size > 10:
-            print(f"📎 Sending file: {exported_path} ({file_size} bytes)")
             with open(exported_path, "rb") as f:
                 await update.message.reply_document(
                     document=InputFile(f, filename=os.path.basename(exported_path))
                 )
         else:
             await update.message.reply_text("❌ Exported file is too small or empty.")
+        os.remove(exported_path)
     else:
         await update.message.reply_text("❌ Cookie invalid or processing failed.")
 
-    os.remove(filename)
+# ========== Telegram Bot Logic ==========
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Send me a `.txt`, `.zip`, or `.rar` file containing cookies and I’ll process them.")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("❌ Please send a valid file.")
+        return
+
+    file_ext = os.path.splitext(document.file_name)[-1].lower()
+
+    if file_ext not in [".txt", ".zip", ".rar"]:
+        await update.message.reply_text("❌ Please send a `.txt`, `.zip`, or `.rar` file only.")
+        return
+
+    unique_id = uuid.uuid4().hex[:8]
+    downloaded_name = f"upload_{unique_id}{file_ext}"
+    await document.get_file().then(lambda f: f.download_to_drive(downloaded_name))
+
+    if file_ext == ".txt":
+        await update.message.reply_text("🔄 Processing your cookie...")
+        exported_path = await process_cookie_file(downloaded_name)
+        await send_result(update, exported_path)
+        os.remove(downloaded_name)
+
+    else:
+        extract_dir = f"extracted_{unique_id}"
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            Archive(downloaded_name).extractall(extract_dir)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to extract archive: {e}")
+            shutil.rmtree(extract_dir)
+            os.remove(downloaded_name)
+            return
+
+        processed = 0
+        for root, dirs, files in os.walk(extract_dir):
+            for filename in files:
+                if filename.endswith(".txt"):
+                    full_path = os.path.join(root, filename)
+                    await update.message.reply_text(f"🔄 Processing `{filename}`...")
+                    exported_path = await process_cookie_file(full_path)
+                    if exported_path:
+                        await send_result(update, exported_path)
+                        processed += 1
+
+        if processed == 0:
+            await update.message.reply_text("❌ No valid `.txt` cookie files found in the archive.")
+
+        shutil.rmtree(extract_dir)
+        os.remove(downloaded_name)
 
 # ========== Start the Bot ==========
 
