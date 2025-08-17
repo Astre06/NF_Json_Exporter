@@ -201,6 +201,7 @@ class WorkerPool:
     def __init__(self, max_workers=WORKERS):
         self.max_workers = max_workers
         self.executor = None
+        self.active_tasks = 0
     
     def start(self):
         if self.executor is None:
@@ -217,6 +218,9 @@ class WorkerPool:
         if not self.executor:
             self.start()
         
+        self.active_tasks += 1
+        logger.info(f"Active tasks: {self.active_tasks}/{self.max_workers}")
+        
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(
@@ -228,147 +232,161 @@ class WorkerPool:
         except Exception as e:
             logger.error(f"Worker process failed: {e}")
             return None
+        finally:
+            self.active_tasks -= 1
+            logger.info(f"Task completed. Active tasks: {self.active_tasks}/{self.max_workers}")
 
 # Global worker pool instance
 worker_pool = WorkerPool(max_workers=WORKERS)
 
-async def process_cookie_file(input_path):
-    """Main interface for processing cookie files using worker pool"""
-    return await worker_pool.process_file(input_path)
+# Semaphore to control concurrent operations
+semaphore = asyncio.Semaphore(WORKERS)
 
-async def send_result(update, exported_path):
+async def process_cookie_file(input_path):
+    """Main interface for processing cookie files using worker pool with concurrency control"""
+    async with semaphore:
+        return await worker_pool.process_file(input_path)
+
+async def send_result(update, exported_path, filename=None):
     if exported_path and os.path.isfile(exported_path):
         file_size = os.path.getsize(exported_path)
         if file_size > 10:
             with open(exported_path, "rb") as f:
+                display_name = filename if filename else os.path.basename(exported_path)
                 await update.message.reply_document(
-                    document=InputFile(f, filename=os.path.basename(exported_path))
+                    document=InputFile(f, filename=f"processed_{display_name}")
                 )
         else:
-            await update.message.reply_text("❌ Exported file is too small or empty.")
+            await update.message.reply_text(f"❌ Exported file for {filename or 'file'} is too small or empty.")
         os.remove(exported_path)
+        return True
     else:
-        await update.message.reply_text("❌ Cookie invalid or processing failed.")
+        await update.message.reply_text(f"❌ Cookie invalid or processing failed for {filename or 'file'}.")
+        return False
+
+# ========== Parallel Processing Functions ==========
+
+async def process_files_in_parallel(txt_files, update):
+    """Process multiple files in parallel using all available workers"""
+    total_files = len(txt_files)
+    
+    if total_files == 1:
+        # Single file - just process it
+        full_path, filename = txt_files[0]
+        await update.message.reply_text(f"🔄 Processing `{filename}`...")
+        exported_path = await process_cookie_file(full_path)
+        success = await send_result(update, exported_path, filename)
+        return 1 if success else 0
+    
+    # Multiple files - process in parallel
+    await update.message.reply_text(f"🚀 Starting parallel processing of {total_files} files with {WORKERS} workers...")
+    
+    # Create tasks for all files
+    tasks = []
+    file_info = []
+    
+    for full_path, filename in txt_files:
+        task = process_cookie_file(full_path)
+        tasks.append(task)
+        file_info.append((full_path, filename))
+    
+    # Process all files in parallel
+    logger.info(f"Executing {len(tasks)} tasks in parallel...")
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Process results
+    processed = 0
+    failed = 0
+    
+    for i, (result, (full_path, filename)) in enumerate(zip(results, file_info)):
+        if isinstance(result, Exception):
+            logger.error(f"Failed to process {filename}: {result}")
+            await update.message.reply_text(f"❌ Error processing `{filename}`: {str(result)[:100]}")
+            failed += 1
+        else:
+            exported_path = result
+            if exported_path:
+                success = await send_result(update, exported_path, filename)
+                if success:
+                    processed += 1
+                    await update.message.reply_text(f"✅ Successfully processed `{filename}`")
+                else:
+                    failed += 1
+            else:
+                await update.message.reply_text(f"❌ Invalid cookies in `{filename}`")
+                failed += 1
+    
+    return processed
+
+async def process_files_in_batches(txt_files, update, batch_size=None):
+    """Process files in batches for better progress tracking with large archives"""
+    if batch_size is None:
+        batch_size = WORKERS * 2  # Process 2x workers per batch for better throughput
+    
+    total_files = len(txt_files)
+    processed = 0
+    
+    # Process files in batches
+    for i in range(0, total_files, batch_size):
+        batch = txt_files[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (total_files + batch_size - 1) // batch_size
+        
+        await update.message.reply_text(
+            f"🔄 Processing batch {batch_num}/{total_batches} ({len(batch)} files) with {WORKERS} workers..."
+        )
+        
+        # Process current batch in parallel
+        batch_tasks = []
+        batch_info = []
+        
+        for full_path, filename in batch:
+            task = process_cookie_file(full_path)
+            batch_tasks.append(task)
+            batch_info.append((full_path, filename))
+        
+        # Execute batch in parallel
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        
+        # Handle batch results
+        batch_processed = 0
+        for result, (full_path, filename) in zip(batch_results, batch_info):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to process {filename}: {result}")
+            elif result:
+                success = await send_result(update, result, filename)
+                if success:
+                    batch_processed += 1
+        
+        processed += batch_processed
+        
+        # Progress update
+        progress_pct = ((i + len(batch)) / total_files) * 100
+        await update.message.reply_text(
+            f"📊 Batch {batch_num} complete: {batch_processed}/{len(batch)} successful\n"
+            f"📈 Overall progress: {min(i + len(batch), total_files)}/{total_files} ({progress_pct:.1f}%)"
+        )
+    
+    return processed
 
 # ========== Bot Commands ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I'll process each for you.\n"
-        f"🔧 Running with {WORKERS} workers for faster processing!"
+        f"🚀 Running with {WORKERS} parallel workers for faster processing!\n"
+        f"⚡ Multiple files will be processed simultaneously for maximum speed."
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"pong 🏓\n⚙️ Workers: {WORKERS}")
+    await update.message.reply_text(f"pong 🏓\n⚙️ Workers: {WORKERS}\n🔥 Parallel processing enabled!")
 
 async def workers_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to show current worker configuration"""
+    pool_status = 'Running' if worker_pool.executor else 'Stopped'
     await update.message.reply_text(
         f"⚙️ Worker Configuration:\n"
         f"• Active Workers: {WORKERS}\n"
-        f"• Pool Status: {'Running' if worker_pool.executor else 'Stopped'}\n"
-        f"• Process ID: {os.getpid()}"
-    )
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("❌ Please send a valid file.")
-        return
-
-    file_ext = os.path.splitext(document.file_name)[-1].lower()
-
-    if file_ext not in [".txt", ".zip", ".rar"]:
-        await update.message.reply_text("❌ Please send a `.txt`, `.zip`, or `.rar` file only.")
-        return
-
-    unique_id = uuid.uuid4().hex[:8]
-    downloaded_name = f"upload_{unique_id}{file_ext}"
-    telegram_file = await document.get_file()
-    await telegram_file.download_to_drive(downloaded_name)
-
-    if file_ext == ".txt":
-        await update.message.reply_text(f"🔄 Processing your cookie with {WORKERS} workers...")
-        exported_path = await process_cookie_file(downloaded_name)
-        await send_result(update, exported_path)
-        os.remove(downloaded_name)
-    else:
-        extract_dir = f"extracted_{unique_id}"
-        os.makedirs(extract_dir, exist_ok=True)
-        try:
-            Archive(downloaded_name).extractall(extract_dir)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed to extract archive: {e}")
-            shutil.rmtree(extract_dir)
-            os.remove(downloaded_name)
-            return
-
-        processed = 0
-        tasks = []
-        
-        # Collect all .txt files first
-        txt_files = []
-        for root, dirs, files in os.walk(extract_dir):
-            for filename in files:
-                if filename.endswith(".txt"):
-                    txt_files.append((os.path.join(root, filename), filename))
-        
-        if not txt_files:
-            await update.message.reply_text("❌ No valid `.txt` cookie files found in the archive.")
-            shutil.rmtree(extract_dir)
-            os.remove(downloaded_name)
-            return
-        
-        await update.message.reply_text(f"📁 Found {len(txt_files)} cookie files. Processing with {WORKERS} workers...")
-        
-        # Process files with worker pool
-        for full_path, filename in txt_files:
-            await update.message.reply_text(f"🔄 Processing `{filename}`...")
-            exported_path = await process_cookie_file(full_path)
-            if exported_path:
-                await send_result(update, exported_path)
-                processed += 1
-
-        if processed == 0:
-            await update.message.reply_text("❌ No valid cookie files were processed successfully.")
-        else:
-            await update.message.reply_text(f"✅ Successfully processed {processed}/{len(txt_files)} files!")
-
-        shutil.rmtree(extract_dir)
-        os.remove(downloaded_name)
-
-# ========== Application Shutdown Handler ==========
-async def shutdown_handler(app):
-    """Gracefully shutdown worker pool"""
-    logger.info("Shutting down worker pool...")
-    worker_pool.stop()
-
-# ========== Run Bot ==========
-
-async def post_init(app):
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    me = await app.bot.get_me()
-    logger.info("✅ Logged in as @%s (%s)", me.username, me.id)
-    logger.info(f"🔧 Initialized with {WORKERS} workers")
-    
-    # Start worker pool
-    worker_pool.start()
-
-if __name__ == "__main__":
-    # Set multiprocessing start method for compatibility
-    multiprocessing.set_start_method('spawn', force=True)
-    
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("workers", workers_info))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    try:
-        print(f"🤖 Bot is running with {WORKERS} workers...")
-        app.run_polling(drop_pending_updates=True)
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    finally:
-        # Cleanup worker pool
-        worker_pool.stop()
+        f"• Pool Status: {pool_status}\n"
+        f"• Active Tasks: {worker_pool.active_tasks}\n"
+        f"• Process ID: {os.
