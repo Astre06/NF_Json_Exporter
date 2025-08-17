@@ -560,5 +560,4 @@ if __name__ == "__main__":
         # Cleanup worker pool
         worker_pool.stop()
 
-```
 
