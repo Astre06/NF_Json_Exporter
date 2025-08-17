@@ -5,8 +5,6 @@ import asyncio
 import re
 import shutil
 import logging
-from urllib.parse import urlparse
-
 from pyunpack import Archive
 from telegram import Update, InputFile
 from telegram.ext import (
@@ -23,22 +21,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========== Config ==========
-BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # <-- put your bot token here
-TARGET_URL = "https://example.com"  # <-- set your target URL here
+BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"
+TARGET_URL = "https://www.netflix.com/account"
 
 # ========== Helpers ==========
-
-def _domain_from_url(url: str) -> str:
-    try:
-        netloc = urlparse(url).netloc.lower()
-        # strip port and common prefix
-        if ":" in netloc:
-            netloc = netloc.split(":", 1)[0]
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
-        return netloc
-    except Exception:
-        return ""
 
 def normalize_cookie(c):
     out = {
@@ -70,71 +56,23 @@ def next_export_filename(base="working", ext=".txt"):
     next_num = max(nums, default=0) + 1
     return f"{base}{next_num}{ext}"
 
-def parse_netscape_cookie_file_flexible(path):
-    cookies = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if not (line.startswith(".") or line[0].isalnum()):
-                continue
-
-            parts = re.split(r"\s+", line)
-            if len(parts) < 2:
-                continue
-
-            # Canonical order (best-effort for short lines):
-            # domain, include_subdomains, path, secure, expires, name, value
-            domain = parts[0]
-            path = parts[2] if len(parts) > 2 else "/"
-            secure_flag = parts[3] if len(parts) > 3 else "FALSE"
-            expires_str = parts[4] if len(parts) > 4 else "-1"
-            name = parts[5] if len(parts) > 5 else ""
-            value = parts[6] if len(parts) > 6 else ""
-            
-            try:
-                expires = int(expires_str) if expires_str != "-1" else None
-            except ValueError:
-                expires = None
-                
-            cookies.append({
-                "name": name,
-                "value": value,
-                "domain": domain,
-                "path": path or "/",
-                "httpOnly": False,  # not present in Netscape files
-                "secure": str(secure_flag).upper() == "TRUE",
-                **({"expires": expires} if (isinstance(expires, int) and expires > 0) else {}),
-                "sameSite": "Lax",  # Netscape doesn't encode this
-            })
-    return cookies
-
 async def process_cookie_file(input_path):
     logger.info(f"Processing file: {input_path}")
-
-    playwright_cookies = []
-
-    # --- Try JSON first ---
     try:
         with open(input_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        all_cookies = data if isinstance(data, list) else [data]
-        for c in all_cookies:
-            try:
-                playwright_cookies.append(normalize_cookie(c))
-            except Exception as e:
-                logger.warning(f"Skipping malformed cookie: {e}")
-    except Exception as e_json:
-        logger.info(f"Not JSON or failed to parse JSON: {e_json}")
-        # --- Fallback: Netscape flexible parser ---
+    except Exception as e:
+        logger.error(f"Failed to load JSON: {e}")
+        return None
+
+    all_cookies = data if isinstance(data, list) else [data]
+    playwright_cookies = []
+
+    for c in all_cookies:
         try:
-            netscape_cookies = parse_netscape_cookie_file_flexible(input_path)
-            if netscape_cookies:
-                playwright_cookies.extend(netscape_cookies)
-                logger.info(f"Parsed {len(netscape_cookies)} cookie(s) from Netscape format")
-        except Exception as e_ns:
-            logger.error(f"Failed to parse Netscape cookie file: {e_ns}")
+            playwright_cookies.append(normalize_cookie(c))
+        except Exception as e:
+            logger.warning(f"Skipping malformed cookie: {e}")
 
     if not playwright_cookies:
         logger.error("No valid cookies to process.")
@@ -201,7 +139,7 @@ async def send_result(update, exported_path):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I'll process each for you."
+        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I’ll process each for you."
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,3 +209,4 @@ app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("🤖 Bot is running...")
 app.run_polling(drop_pending_updates=True)
+
