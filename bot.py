@@ -56,16 +56,79 @@ def next_export_filename(base="working", ext=".txt"):
     next_num = max(nums, default=0) + 1
     return f"{base}{next_num}{ext}"
 
+def parse_netscape_cookies(file_path):
+    """Parse Netscape cookie format to JSON format"""
+    cookies = []
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Split by tabs
+                parts = line.split('\t')
+                if len(parts) >= 7:
+                    domain = parts[0]
+                    domain_specified = parts[1].upper() == 'TRUE'
+                    path = parts[2]
+                    secure = parts[3].upper() == 'TRUE'
+                    expires = int(parts[4]) if parts[4] and parts[4] != '0' else None
+                    name = parts[5]
+                    value = parts[6]
+                    
+                    cookie = {
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
+                        "path": path,
+                        "secure": secure,
+                        "httpOnly": False,
+                        "sameSite": "lax"
+                    }
+                    
+                    if expires:
+                        cookie["expires"] = expires
+                    
+                    cookies.append(cookie)
+                    
+    except Exception as e:
+        logger.error(f"Failed to parse Netscape cookies: {e}")
+        return None
+    
+    return cookies
+
 async def process_cookie_file(input_path):
     logger.info(f"Processing file: {input_path}")
+    
+    # Try to detect file format
     try:
         with open(input_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            first_line = f.readline().strip()
+            f.seek(0)  # Reset file pointer
+            
+            # Check if it's Netscape format
+            if first_line.startswith('#') or '\t' in first_line:
+                logger.info("Detected Netscape cookie format")
+                all_cookies = parse_netscape_cookies(input_path)
+                if not all_cookies:
+                    return None
+            else:
+                # Try JSON format
+                logger.info("Attempting JSON cookie format")
+                try:
+                    data = json.load(f)
+                    all_cookies = data if isinstance(data, list) else [data]
+                except json.JSONDecodeError:
+                    logger.error("File is neither valid JSON nor Netscape format")
+                    return None
+                    
     except Exception as e:
-        logger.error(f"Failed to load JSON: {e}")
+        logger.error(f"Failed to read file: {e}")
         return None
 
-    all_cookies = data if isinstance(data, list) else [data]
     playwright_cookies = []
 
     for c in all_cookies:
@@ -139,7 +202,7 @@ async def send_result(update, exported_path):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I’ll process each for you."
+        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I'll process each for you."
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,4 +272,3 @@ app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("🤖 Bot is running...")
 app.run_polling(drop_pending_updates=True)
-
