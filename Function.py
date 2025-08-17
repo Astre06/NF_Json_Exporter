@@ -31,7 +31,7 @@ def normalize_cookie(c):
     out["sameSite"] = mapping.get(ss, "Lax")
     return out
 
-def next_export_filename(base="exported_", ext=".txt"):
+def next_export_filename(base="working", ext=".txt"):
     files = [f for f in os.listdir() if f.startswith(base) and f.endswith(ext)]
     nums = [int(re.search(rf"{base}(\d+){ext}", f).group(1)) for f in files if re.search(rf"{base}(\d+){ext}", f)]
     next_num = max(nums, default=0) + 1
