@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 # ========== Config ==========
 BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # <-- put your bot token here
-# REQUIRED: only process cookies for domains you own/control
+TARGET_URL = "https://example.com"  # <-- set your target URL here
+
 # ========== Helpers ==========
 
 def _domain_from_url(url: str) -> str:
@@ -38,10 +39,6 @@ def _domain_from_url(url: str) -> str:
         return netloc
     except Exception:
         return ""
-
-def _is_allowed_domain(host: str, allowed) -> bool:
-    host = host.lstrip(".").lower()
-    return any(host.endswith(d.lower()) for d in allowed)
 
 def normalize_cookie(c):
     out = {
@@ -73,16 +70,7 @@ def next_export_filename(base="working", ext=".txt"):
     next_num = max(nums, default=0) + 1
     return f"{base}{next_num}{ext}"
 
-def parse_netscape_cookie_file_flexible(path, allowed_domains=None):
-    """
-    Robust Netscape/Mozilla cookie parser.
-    Accepts lines starting with '.' (domain cookie) or alnum (host cookie),
-    skips '#' comments and blank lines.
-    Handles classic 7-column format and shorter variants.
-
-    Returns Playwright-compatible cookie dicts.
-    Filters to allowed_domains if provided.
-    """
+def parse_netscape_cookie_file_flexible(path):
     cookies = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
@@ -104,15 +92,12 @@ def parse_netscape_cookie_file_flexible(path, allowed_domains=None):
             expires_str = parts[4] if len(parts) > 4 else "-1"
             name = parts[5] if len(parts) > 5 else ""
             value = parts[6] if len(parts) > 6 else ""
-
-            if allowed_domains and not any(domain.lstrip(".").lower().endswith(d.lower()) for d in allowed_domains):
-                continue
-
+            
             try:
-                expires = int(expires_str)
+                expires = int(expires_str) if expires_str != "-1" else None
             except ValueError:
                 expires = None
-
+                
             cookies.append({
                 "name": name,
                 "value": value,
@@ -128,15 +113,6 @@ def parse_netscape_cookie_file_flexible(path, allowed_domains=None):
 async def process_cookie_file(input_path):
     logger.info(f"Processing file: {input_path}")
 
-    # Guardrails
-    if not isinstance(ALLOWED_DOMAINS, (list, tuple)) or not ALLOWED_DOMAINS:
-        logger.error("ALLOWED_DOMAINS must be a non-empty list of domains you control.")
-        return None
-    target_host = _domain_from_url(TARGET_URL)
-    if not target_host or not _is_allowed_domain(target_host, ALLOWED_DOMAINS):
-        logger.error(f"TARGET_URL domain '{target_host}' is not in ALLOWED_DOMAINS {ALLOWED_DOMAINS}.")
-        return None
-
     playwright_cookies = []
 
     # --- Try JSON first ---
@@ -146,10 +122,6 @@ async def process_cookie_file(input_path):
         all_cookies = data if isinstance(data, list) else [data]
         for c in all_cookies:
             try:
-                # filter here too
-                dom = c.get("domain", "")
-                if dom and not _is_allowed_domain(dom, ALLOWED_DOMAINS):
-                    continue
                 playwright_cookies.append(normalize_cookie(c))
             except Exception as e:
                 logger.warning(f"Skipping malformed cookie: {e}")
@@ -157,10 +129,7 @@ async def process_cookie_file(input_path):
         logger.info(f"Not JSON or failed to parse JSON: {e_json}")
         # --- Fallback: Netscape flexible parser ---
         try:
-            netscape_cookies = parse_netscape_cookie_file_flexible(
-                input_path,
-                allowed_domains=ALLOWED_DOMAINS
-            )
+            netscape_cookies = parse_netscape_cookie_file_flexible(input_path)
             if netscape_cookies:
                 playwright_cookies.extend(netscape_cookies)
                 logger.info(f"Parsed {len(netscape_cookies)} cookie(s) from Netscape format")
@@ -186,13 +155,6 @@ async def process_cookie_file(input_path):
         logger.info(f"Navigating to {TARGET_URL}...")
         await page.goto(TARGET_URL, wait_until="load")
         await page.wait_for_load_state("networkidle")
-
-        # extra safety: confirm we stayed on an allowed domain
-        final_host = _domain_from_url(page.url)
-        if not _is_allowed_domain(final_host, ALLOWED_DOMAINS):
-            logger.warning(f"Final URL '{page.url}' not in allowed domains {ALLOWED_DOMAINS}")
-            await browser.close()
-            return None
 
         if page.url.startswith(TARGET_URL):
             logger.info("✅ Valid session — account page loaded")
@@ -239,7 +201,7 @@ async def send_result(update, exported_path):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I’ll process each for you."
+        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I'll process each for you."
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,5 +271,3 @@ app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("🤖 Bot is running...")
 app.run_polling(drop_pending_updates=True)
-
-
