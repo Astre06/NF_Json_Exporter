@@ -4,12 +4,24 @@ import json
 import asyncio
 import re
 import shutil
+import logging
 from pyunpack import Archive
 from telegram import Update, InputFile
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, MessageHandler, CommandHandler,
+    ContextTypes, filters
+)
 from playwright.async_api import async_playwright
 
-BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # ← Replace with your bot token
+# ========== Logging ==========
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ========== Config ==========
+BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"
 TARGET_URL = "https://www.netflix.com/account"
 
 # ========== Helpers ==========
@@ -128,6 +140,9 @@ async def send_result(update, exported_path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I’ll process each for you.")
 
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong 🏓")
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document:
@@ -178,12 +193,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(extract_dir)
         os.remove(downloaded_name)
 
-# ========== Start the Bot ==========
+# ========== Init & Run ==========
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+async def post_init(app):
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    me = await app.bot.get_me()
+    logger.info("✅ Logged in as @%s (%s)", me.username, me.id)
+
+app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("ping", ping))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("🤖 Bot is running...")
-app.run_polling()
-
+app.run_polling(drop_pending_updates=True)
