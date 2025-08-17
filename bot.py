@@ -5,7 +5,7 @@ import subprocess
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
-BOT_TOKEN = "8495284623:AAHiz1sJeaufKkO6mz5fvqJwykTglMVQhPU"  # Replace if needed
+BOT_TOKEN = "8495284623:AAH_XdT-TbKg9LH41ZYwXvmxNZwhkNtaCT8"  # Replace if needed
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Send me a `.txt` cookie file and I’ll send back the exported one.")
@@ -45,3 +45,4 @@ app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("🤖 Bot is running...")
 app.run_polling()
+
