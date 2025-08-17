@@ -9,7 +9,7 @@ from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from playwright.async_api import async_playwright
 
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # ← Replace with your bot token
+BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"  # ← Replace with your bot token
 TARGET_URL = "https://www.netflix.com/account"
 
 # ========== Helpers ==========
@@ -186,3 +186,4 @@ app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("🤖 Bot is running...")
 app.run_polling()
+
