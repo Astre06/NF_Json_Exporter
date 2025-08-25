@@ -19,7 +19,7 @@ from playwright.async_api import async_playwright
 
 # ========== Configuration ==========
 WORKERS = 5  # Change this to adjust worker count
-BOT_TOKEN = "8495284623:AAGrHUozvJcqQKzdUl2r29rnXHMwInO2g30"
+BOT_TOKEN = "8495284623:AAGHK9oTW1IKZUu_fZqPVjilCopiYPBgqhw"
 TARGET_URL = "https://www.netflix.com/account"
 
 # ========== Logging ==========
@@ -667,5 +667,6 @@ if __name__ == "__main__":
     finally:
         # Cleanup worker pool
         worker_pool.stop()
+
 
 
